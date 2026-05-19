@@ -228,6 +228,10 @@ int main(int argc, char **argv)
 	skel->rodata->min_lat_ns = min_lat_ms * 1000 * 1000;
 	skel->rodata->wakeup_data_size = wakeup_data_size;
 
+	/* Disable auto-attach for both __release_mid variants */
+	bpf_program__set_autoattach(skel->progs.mid_release_kref, false);
+	bpf_program__set_autoattach(skel->progs.mid_release_direct, false);
+
 	err = smbslower_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
@@ -250,6 +254,17 @@ int main(int argc, char **argv)
 	if(err) {
 		fprintf(stderr, "Failed to attach BPF skeleton\n");
 		goto cleanup_shm;
+	}
+
+	/* Try attaching the 6.19+ variant first, fall back to kref variant */
+	struct bpf_link *release_link;
+	release_link = bpf_program__attach(skel->progs.mid_release_direct);
+	if (!release_link) {
+		release_link = bpf_program__attach(skel->progs.mid_release_kref);
+		if (!release_link) {
+			fprintf(stderr, "Failed to attach __release_mid (tried both variants)\n");
+			goto cleanup_shm;
+		}
 	}
 
 	int map_fd = bpf_obj_get(RINGBUF_PINNED);
@@ -294,7 +309,10 @@ cleanup:
 		ring_buffer__free(rb);
 	if (map_fd >= 0)
 		close(map_fd);
-	smbslower_bpf__destroy(skel);
+    if (release_link)
+        bpf_link__destroy(release_link);
+	
+    smbslower_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
 }

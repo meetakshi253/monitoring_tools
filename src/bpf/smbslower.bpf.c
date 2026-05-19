@@ -62,23 +62,17 @@ struct mid_q_entry *mid_struct)
 	return 0;
 }
 
-SEC("fentry/__release_mid")
-int BPF_PROG(mid_release_fentry, struct kref *refcount) {
+static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
+{
 	struct smb_partial_event *pe;
 	struct event *e;
 	long flag = get_flags();
 
-	/* reserve space in the ringbuffer first */
 	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
 	if (!e) {
 		bpf_printk("bpf_ringbuf_reserve failed");
 		return 0;
 	}
-
-	const typeof(((struct mid_q_entry *)0)->refcount) *__mptr =
-		(const typeof(((struct mid_q_entry *)0)->refcount) *)refcount;
-	struct mid_q_entry *mid_struct =
-		(struct mid_q_entry *)((char *)__mptr - offsetof(struct mid_q_entry, refcount));
 
 	pe = bpf_map_lookup_elem(&temp, &mid_struct);
 	if (!pe) {
@@ -87,7 +81,7 @@ int BPF_PROG(mid_release_fentry, struct kref *refcount) {
 		return 0;
 	}
 	bpf_map_delete_elem(&temp, &mid_struct);
-	
+
 	e->cmd_end_time_ns = bpf_ktime_get_ns();
 	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
 
@@ -104,4 +98,22 @@ int BPF_PROG(mid_release_fentry, struct kref *refcount) {
 	bpf_ringbuf_submit(e, flag);
 
 	return 0;
+}
+
+/* Pre-6.19: __release_mid(struct kref *refcount) */
+SEC("fentry/__release_mid")
+int BPF_PROG(mid_release_kref, struct kref *refcount) {
+	const typeof(((struct mid_q_entry *)0)->refcount) *__mptr =
+		(const typeof(((struct mid_q_entry *)0)->refcount) *)refcount;
+	struct mid_q_entry *mid_struct =
+		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
+
+	return handle_release_mid(mid_struct);
+}
+
+/* 6.19+: __release_mid(struct TCP_Server_Info *server, struct mid_q_entry *midEntry) */
+SEC("fentry/__release_mid")
+int BPF_PROG(mid_release_direct, struct TCP_Server_Info *server, struct mid_q_entry *midEntry) {
+	(void)server;
+	return handle_release_mid(midEntry);
 }
