@@ -3,28 +3,20 @@
 /* Copyright (c) 2026 Microsoft */
 #define _POSIX_C_SOURCE 200809L
 #include <argp.h>
-#include <signal.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#include "shm_writer.h"
 #include "smb_diag.h"
-#include "command_translator.h"
 #include "smbslower.skel.h"
 
-#define NSEC_PER_SEC	     1000000000LL
 #define warn(...)	     fprintf(stderr, __VA_ARGS__)
 
-static volatile sig_atomic_t exiting = 0;
-static struct shm_ringbuf *shm_ptr;
-
-static time_t duration = 0;
 static __u64 min_lat_ms = 10;
 static __u64 wakeup_data_size = 0; /* used to wake up the user space handler */
 
@@ -32,11 +24,10 @@ static bool include_mode = false, exclude_mode = false;
 static __u8 cmd_filter[MAX_SMB_COMMANDS] = {0};
 
 const char *argp_program_version = "smbslower 0.1";
-const char *argp_program_bug_address = "https://github.com/iovisor/bcc/tree/master/libbpf-tools";
+const char *argp_program_bug_address = "https://github.com/meetakshi253/monitoring_tools";
 
 static const struct argp_option opts[] = {
 	{ "wakeupsize", 'w', "WAKEUPSIZE", 0, "Wake up the userspace handler" },
-	{ "duration", 'd', "DURATION", 0, "Total duration of trace in seconds" },
 	{ "include-cmds", 'c', "INCLUDE", 0, "Allowed SMB commands to trace" },
 	{ "exclude-cmds", 'x', "EXCLUDE", 0, "SMB commands to exclude from tracing"},
 	{ "min", 'm', "MIN", 0, "Min latency to trace, in ms (default 10)" },
@@ -67,14 +58,6 @@ static int parse_cmd_list(const char *arg, int max_cmds) {
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
 	switch (key) {
-	case 'd':
-		errno = 0;
-		duration = strtol(arg, NULL, 10);
-		if (errno || duration <= 0) {
-			warn("invalid DURATION: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
 	case 'w':
 		errno = 0;
 		wakeup_data_size = strtoll(arg, NULL, 10);
@@ -147,45 +130,6 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 	return vfprintf(stderr, format, args);
 }
 
-static void sig_int(int signo)
-{
-	exiting = 1;
-}
-
-static int handle_event(void *ctx, void *data, size_t data_sz)
-{
-	const struct event *e = data;
-	if (data_sz < sizeof(*e)) {
-		printf("Error: packet too small\n");
-		return 0;
-	}
-
-	printf("%d %s %d %lld %lld\n", e->pid, e->task, e->command, e->mid, e->cmd_end_time_ns);	
-	printf("writing to shared memory");
-	if (shm_ringbuf_write(shm_ptr, e) < 0) {
-		fprintf(stderr, "Failed to write event to shared memory\n");
-		return -1; // Not enough space
-	}
-	/* We have opened shared memory here between the python event dispatcher and this program */
-
-	return 0;
-}
-
-static struct timespec get_end_time_from_duration()
-{
-	struct timespec end_time, start_time;
-	clock_gettime(CLOCK_REALTIME, &start_time);
-	long long duration_ns = (long long)duration * NSEC_PER_SEC;
-	end_time.tv_sec = start_time.tv_sec + duration_ns / NSEC_PER_SEC;
-	end_time.tv_nsec = start_time.tv_nsec + duration_ns % NSEC_PER_SEC;
-
-	if (end_time.tv_nsec >= NSEC_PER_SEC) {
-		end_time.tv_sec += 1;
-		end_time.tv_sec -= NSEC_PER_SEC;
-	}
-	return end_time;
-}
-
 int update_denylist_map(struct smbslower_bpf *skel) {
 	for (__u16 cmd = 0; cmd < MAX_SMB_COMMANDS; cmd ++) {
 		bool deny = false;
@@ -193,7 +137,6 @@ int update_denylist_map(struct smbslower_bpf *skel) {
 		else if (include_mode && !cmd_filter[cmd]) deny = true;
 
 		if (deny) {
-			printf("Denying command %d (%s)\n", cmd, get_smb_command(cmd));
 			if (bpf_map_update_elem(bpf_map__fd(skel->maps.denylist), &cmd, &deny, BPF_ANY) < 0) {
 				warn("Failed to update denylist map for command %d\n", cmd);
 				return -1;
@@ -205,36 +148,32 @@ int update_denylist_map(struct smbslower_bpf *skel) {
 
 int main(int argc, char **argv)
 {
-	struct ring_buffer *rb = NULL;
 	struct smbslower_bpf *skel;
-	struct timespec end_time, current_time;
+	struct bpf_link *release_link = NULL;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) return err;
-	
-	libbpf_set_print(libbpf_print_fn);
 
-	/* Cleaner handling of Ctrl-C */
-	signal(SIGINT, sig_int);
-	signal(SIGTERM, sig_int);
+	libbpf_set_print(libbpf_print_fn);
 
 	skel = smbslower_bpf__open();
 	if (!skel) {
-		fprintf(stderr, "Failed to open and load BPF skeleton\n");
+		fprintf(stderr, "Failed to open BPF skeleton\n");
 		return 1;
 	}
 
 	skel->rodata->min_lat_ns = min_lat_ms * 1000 * 1000;
 	skel->rodata->wakeup_data_size = wakeup_data_size;
 
-	/* Disable auto-attach for both __release_mid variants */
+	/* Disable auto-attach for both __release_mid variants because
+	 * we want to load only one of them conditionally */
 	bpf_program__set_autoattach(skel->progs.mid_release_kref, false);
 	bpf_program__set_autoattach(skel->progs.mid_release_direct, false);
 
 	err = smbslower_bpf__load(skel);
 	if (err) {
-		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+		fprintf(stderr, "Failed to load BPF skeleton\n");
 		goto cleanup;
 	}
 
@@ -243,76 +182,52 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Open shared memory */
-	int shm_fd = init_shared_memory(SHM_NAME, SHM_SIZE, &shm_ptr);
-	if (shm_fd < 0) {
-		fprintf(stderr, "Shared memory init failed from C program\n");
-		goto cleanup_shm;
-	}
-
 	err = smbslower_bpf__attach(skel);
-	if(err) {
+	if (err) {
 		fprintf(stderr, "Failed to attach BPF skeleton\n");
-		goto cleanup_shm;
+		goto cleanup;
 	}
 
-	/* Try attaching the 6.19+ variant first, fall back to kref variant */
-	struct bpf_link *release_link;
+	/* Try attaching the 6.19+ variant first, fall back to older variant */
 	release_link = bpf_program__attach(skel->progs.mid_release_direct);
 	if (!release_link) {
 		release_link = bpf_program__attach(skel->progs.mid_release_kref);
 		if (!release_link) {
 			fprintf(stderr, "Failed to attach __release_mid (tried both variants)\n");
-			goto cleanup_shm;
+			goto cleanup;
 		}
 	}
 
-	int map_fd = bpf_obj_get(RINGBUF_PINNED);
-    if (map_fd < 0) {
-        perror("bpf_obj_get");
-        err = -1;
-        goto cleanup;
-    }
-
-	// need to edit size also
-	rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
-	if (!rb) {
-		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
-		goto cleanup_shm;
+	/* Pin links so BPF programs survive this process exiting
+	 * that way, we do not need to keep the C program running to read from
+	 * the ringbuffer - we can just open the fd from Python */
+	err = bpf_link__pin(skel->links.mid_alloc_fexit, LINK_SMB_MID_ALLOC);
+	if (err) {
+		if (err == -EEXIST)
+			fprintf(stderr, "BPF links already pinned. Detach first.\n");
+		else
+			fprintf(stderr, "Failed to pin mid_alloc link: %s\n", strerror(-err));
+		goto cleanup;
 	}
 
-	if (duration) end_time = get_end_time_from_duration();
-
-	/* Poll */
-	while (!exiting) {
-		err = ring_buffer__poll(rb, 5); /* wait only for 5ms to collect other events */
-		if (err < 0 && err != -EINTR) {
-			printf("error polling the ring buffer: %d\n", err);
-			goto cleanup_shm;
-		}
-		if (duration) {
-			clock_gettime(CLOCK_REALTIME, &current_time);
-			double elapsed_seconds = difftime(current_time.tv_sec, end_time.tv_sec);
-			if (elapsed_seconds > 0)
-				goto cleanup_shm;
-		}
-		/* reset err to return 0 if exiting */
-		err = 0;
+	err = bpf_link__pin(release_link, LINK_SMB_MID_RELEASE);
+	if (err) {
+		if (err == -EEXIST)
+			fprintf(stderr, "BPF links already pinned. Detach first.\n");
+		else
+			fprintf(stderr, "Failed to pin mid_release link: %s\n", strerror(-err));
+		unlink(LINK_SMB_MID_ALLOC);
+		goto cleanup;
 	}
 
-cleanup_shm:
-	munmap(shm_ptr, SHM_SIZE);
-	close(shm_fd);
+	printf("smbslower: BPF programs attached and pinned.\n");
+	printf("  Ring buffer: %s\n", RINGBUF_PINNED);
+	printf("  Detach from Python consumer to remove.\n");
+
 cleanup:
-	if (rb)
-		ring_buffer__free(rb);
-	if (map_fd >= 0)
-		close(map_fd);
-    if (release_link)
-        bpf_link__destroy(release_link);
-	
-    smbslower_bpf__destroy(skel);
+	if (release_link)
+		bpf_link__destroy(release_link);
+	smbslower_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
 }
