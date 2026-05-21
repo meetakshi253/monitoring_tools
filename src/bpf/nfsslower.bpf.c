@@ -71,7 +71,6 @@ static int probe_exit(struct rpc_task *task)
 	/* reserve space in the ringbuffer first */
 	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
 	if (!e) {
-		bpf_printk("bpf_ringbuf_reserve failed");
 		return 0;
 	}
 
@@ -103,27 +102,23 @@ static int probe_exit(struct rpc_task *task)
 SEC("fentry/nfs4_setup_sequence")
 int BPF_PROG(nfs4_setup_sequence_entry, void *client, void *args, void *res, struct rpc_task *task)
 {
-	bpf_printk("in fentry for nfs4_setup_sequence");
 	return probe_entry(task);
 }
 
 SEC("kprobe/nfs4_setup_sequence")
 int BPF_KPROBE(nfs4_setup_sequence_kprobe, void *client, void *args, void *res, struct rpc_task *task)
 {
-	bpf_printk("in kprobe for nfs4_setup_sequence");
 	return probe_entry(task);
 }
 
 SEC("fentry/rpc_exit_task")
 int BPF_PROG(rpc_done_entry, struct rpc_task *task)
 {
-	bpf_printk("in fentry for rpc_exit_task");
 	return probe_exit(task);
 }
 
 SEC("kprobe/rpc_exit_task")
 int BPF_KPROBE(rpc_done_kprobe, struct rpc_task *task)
 {
-	bpf_printk("in kprobe for rpc_exit_task");
 	return probe_exit(task);
 }
