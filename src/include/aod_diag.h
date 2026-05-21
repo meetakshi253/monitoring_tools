@@ -22,10 +22,10 @@ struct event {
 	int pid;
     int command;
 	unsigned long long cmd_end_time_ns;
-	unsigned long long mid;
+	unsigned long long rqst_id;
 	union metrics metric;
 	char tool;
 	char task[TASK_COMM_LEN];
-};
+}; //56 bytes
 
 #endif /* __AOD_DIAG_H */

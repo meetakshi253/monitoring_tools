@@ -5,6 +5,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include "nfs_diag.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
@@ -41,41 +42,31 @@ static __always_inline long get_flags()
 	return sz >= wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
 }
 
-SEC("fentry/nfs4_setup_sequence")
-int BPF_PROG(nfs4_setup_sequence_entry, struct nfs_client *client, struct nfs4_sequence_args *args,
-	     struct nfs4_sequence_res *res, struct rpc_task *task)
+static int probe_entry(struct rpc_task *task)
 {
-	(void)args;
-	(void)res;
 	struct nfs_partial_event e;
 	__u32 cid;
 
 	cid = BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
-	bpf_printk("%d", cid);
 
 	e.nfscommand = cid;
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.nfscommand);
 	if (blocked) {
-		bpf_printk("blocked");
 		return 0;
 	}
 
-	bpf_printk("enqueued %d", cid);
-
 	e.metric.latency_ns = bpf_ktime_get_ns();
 	bpf_map_update_elem(&temp, &task, &e, BPF_NOEXIST);
-	return 0;
+	return 0;	
 }
 
-SEC("fentry/rpc_exit_task")
-int BPF_PROG(rpc_done_entry, struct rpc_task *task)
+static int probe_exit(struct rpc_task *task)
 {
 	struct nfs_partial_event *pe;
 	struct event *e;
 	long flag = get_flags();
 
 	int cid = BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
-	bpf_printk("will try to dequeued %d", cid);
 
 	/* reserve space in the ringbuffer first */
 	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
@@ -86,7 +77,6 @@ int BPF_PROG(rpc_done_entry, struct rpc_task *task)
 
 	pe = bpf_map_lookup_elem(&temp, &task);
 	if (!pe) {
-		bpf_printk("no op %p", &task);
 		bpf_ringbuf_discard(e, get_flags());
 		return 0;
 	}
@@ -102,10 +92,38 @@ int BPF_PROG(rpc_done_entry, struct rpc_task *task)
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->command = pe->nfscommand;
-	e->mid = 0;
+	e->rqst_id = bpf_ntohl(BPF_CORE_READ(task, tk_rqstp, rq_xid));
 	e->tool = NFSSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
 	bpf_ringbuf_submit(e, BPF_RB_FORCE_WAKEUP);
 
 	return 0;
+}
+
+SEC("fentry/nfs4_setup_sequence")
+int BPF_PROG(nfs4_setup_sequence_entry, void *client, void *args, void *res, struct rpc_task *task)
+{
+	bpf_printk("in fentry for nfs4_setup_sequence");
+	return probe_entry(task);
+}
+
+SEC("kprobe/nfs4_setup_sequence")
+int BPF_KPROBE(nfs4_setup_sequence_kprobe, void *client, void *args, void *res, struct rpc_task *task)
+{
+	bpf_printk("in kprobe for nfs4_setup_sequence");
+	return probe_entry(task);
+}
+
+SEC("fentry/rpc_exit_task")
+int BPF_PROG(rpc_done_entry, struct rpc_task *task)
+{
+	bpf_printk("in fentry for rpc_exit_task");
+	return probe_exit(task);
+}
+
+SEC("kprobe/rpc_exit_task")
+int BPF_KPROBE(rpc_done_kprobe, struct rpc_task *task)
+{
+	bpf_printk("in kprobe for rpc_exit_task");
+	return probe_exit(task);
 }

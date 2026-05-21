@@ -91,7 +91,7 @@ static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->mid = bpf_le64_to_cpu(pe->mid);
+	e->rqst_id = bpf_le64_to_cpu(pe->mid);
 	e->command = pe->smbcommand;
 	e->tool = SMBSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));

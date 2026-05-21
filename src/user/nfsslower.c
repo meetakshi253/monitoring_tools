@@ -14,6 +14,7 @@
 
 #include "nfs_diag.h"
 #include "nfsslower.skel.h"
+#include "trace_helpers.c"
 
 #define warn(...)	     fprintf(stderr, __VA_ARGS__)
 
@@ -43,11 +44,10 @@ static int parse_cmd_list(const char *arg, int max_cmds) {
 	}
 	char *token = strtok(input, ",");
 	while (token != NULL && count < max_cmds) {
-		int cmd = (__u16)atoi(token);
+		int cmd = atoi(token);
 		if (cmd >= 0 && cmd < MAX_NFS_COMMANDS) {
 			cmd_filter[cmd] = 1;
 			count++;
-			token = strtok(NULL, ",");
 		}
 		token = strtok(NULL, ",");
 	}
@@ -62,7 +62,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'w':
 		errno = 0;
 		wakeup_data_size = strtoll(arg, NULL, 10);
-		if (errno || wakeup_data_size < 0) {
+		if (errno) {
 			warn("invalid wakeup data size: %s\n", arg);
 			argp_usage(state);
 		}
@@ -83,7 +83,6 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			warn("No valid commands specified in include list: %s\n", arg);
 			argp_usage(state);
 		}
-		printf("%d", err);
 		break;
 	case 'x':
 		if (include_mode) {
@@ -105,7 +104,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'm':
 		errno = 0;
 		min_lat_ms = strtoll(arg, NULL, 10);
-		if (errno || min_lat_ms < 0) {
+		if (errno) {
 			warn("invalid latency (in ms): %s\n", arg);
 			argp_usage(state);
 		}
@@ -150,6 +149,7 @@ int update_denylist_map(struct nfsslower_bpf *skel) {
 int main(int argc, char **argv)
 {
     struct nfsslower_bpf *skel;
+	struct bpf_link *pin_seq, *pin_rpc;
 	int err;
 
     err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -166,6 +166,20 @@ int main(int argc, char **argv)
     skel->rodata->min_lat_ns = min_lat_ms * 1000 * 1000;
     skel->rodata->wakeup_data_size = wakeup_data_size;
 
+	if (fentry_can_attach("nfs4_setup_sequence", "nfsv4")) {
+		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_kprobe, false);
+	}
+	else {
+		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_entry, false);
+	}
+	
+	if(fentry_can_attach("rpc_exit_task", "sunrpc")) {
+		bpf_program__set_autoattach(skel->progs.rpc_done_kprobe, false);
+	}
+	else {
+		bpf_program__set_autoattach(skel->progs.rpc_done_entry, false);
+	}
+
     err = nfsslower_bpf__load(skel);
     if (err) {
 		fprintf(stderr, "Failed to load BPF skeleton\n");
@@ -177,14 +191,25 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-    err = nfsslower_bpf__attach(skel);
-    if (err) {
-        fprintf(stderr, "Failed to attach BPF skeleton\n");
-        goto cleanup;
-    }
+	err = nfsslower_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF programs\n");
+		goto cleanup;
+	}
 
-	/* Pin links so BPF programs survive this process exiting */
-	err = bpf_link__pin(skel->links.nfs4_setup_sequence_entry, LINK_NFS_SEQ_SETUP);
+	/* Resolve which links were actually attached */
+	if (skel->links.nfs4_setup_sequence_entry)
+		pin_seq = skel->links.nfs4_setup_sequence_entry;
+	else
+		pin_seq = skel->links.nfs4_setup_sequence_kprobe;
+
+	if (skel->links.rpc_done_entry)
+		pin_rpc = skel->links.rpc_done_entry;
+	else
+		pin_rpc = skel->links.rpc_done_kprobe;
+
+	/* Pin the links so the process can exit without removing them */
+	err = bpf_link__pin(pin_seq, LINK_NFS_SEQ_SETUP);
 	if (err) {
 		if (err == -EEXIST)
 			fprintf(stderr, "BPF links already pinned. Detach first.\n");
@@ -193,7 +218,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	err = bpf_link__pin(skel->links.rpc_done_entry, LINK_NFS_RPC_EXIT);
+	err = bpf_link__pin(pin_rpc, LINK_NFS_RPC_EXIT);
 	if (err) {
 		if (err == -EEXIST)
 			fprintf(stderr, "BPF links already pinned. Detach first.\n");
@@ -203,7 +228,6 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	printf("nfsslower: BPF programs attached and pinned.\n");
 	printf("  Ring buffer: %s\n", RINGBUF_PINNED);
 	printf("  Detach from Python consumer to remove.\n");
 
