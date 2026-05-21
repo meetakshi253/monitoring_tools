@@ -47,9 +47,7 @@ struct mid_q_entry *mid_struct)
 {
 	(void)server;
 	struct smb_partial_event e;
-	__u16 cid;
-	cid = __builtin_preserve_access_index(({shdr->Command; }));
-	e.smbcommand = bpf_le16_to_cpu(cid);
+	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(shdr, Command));
 
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
 	if (blocked) {
@@ -57,7 +55,7 @@ struct mid_q_entry *mid_struct)
 	}
 
 	e.metric.latency_ns = bpf_ktime_get_ns();
-	e.mid = __builtin_preserve_access_index(({mid_struct->mid; }));
+	e.mid = BPF_CORE_READ(mid_struct, mid);
 	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
 	return 0;
 }
@@ -70,13 +68,11 @@ static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
 
 	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
 	if (!e) {
-		bpf_printk("bpf_ringbuf_reserve failed");
 		return 0;
 	}
 
 	pe = bpf_map_lookup_elem(&temp, &mid_struct);
 	if (!pe) {
-		bpf_printk("no op %p", &mid_struct);
 		bpf_ringbuf_discard(e, flag);
 		return 0;
 	}
@@ -91,7 +87,7 @@ static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->rqst_id = bpf_le64_to_cpu(pe->mid);
+	e->rqst_id = pe->mid;
 	e->command = pe->smbcommand;
 	e->tool = SMBSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
@@ -113,7 +109,6 @@ int BPF_PROG(mid_release_kref, struct kref *refcount) {
 
 /* 6.19+: __release_mid(struct TCP_Server_Info *server, struct mid_q_entry *midEntry) */
 SEC("fentry/__release_mid")
-int BPF_PROG(mid_release_direct, struct TCP_Server_Info *server, struct mid_q_entry *midEntry) {
-	(void)server;
+int BPF_PROG(mid_release_direct, void *server, struct mid_q_entry *midEntry) {
 	return handle_release_mid(midEntry);
 }

@@ -43,11 +43,10 @@ static int parse_cmd_list(const char *arg, int max_cmds) {
 	}
 	char *token = strtok(input, ",");
 	while (token != NULL && count < max_cmds) {
-		int cmd = (__u16)atoi(token);
+		int cmd = atoi(token);
 		if (cmd >= 0 && cmd < MAX_SMB_COMMANDS) {
 			cmd_filter[cmd] = 1;
 			count++;
-			token = strtok(NULL, ",");
 		}
 		token = strtok(NULL, ",");
 	}
@@ -61,7 +60,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'w':
 		errno = 0;
 		wakeup_data_size = strtoll(arg, NULL, 10);
-		if (errno || wakeup_data_size < 0) {
+		if (errno) {
 			warn("invalid wakeup data size: %s\n", arg);
 			argp_usage(state);
 		}
@@ -82,7 +81,6 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			warn("No valid commands specified in include list: %s\n", arg);
 			argp_usage(state);
 		}
-		printf("%d", err);
 		break;
 	case 'x':
 		if (include_mode) {
@@ -104,7 +102,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'm':
 		errno = 0;
 		min_lat_ms = strtoll(arg, NULL, 10);
-		if (errno || min_lat_ms < 0) {
+		if (errno) {
 			warn("invalid latency (in ms): %s\n", arg);
 			argp_usage(state);
 		}
@@ -190,10 +188,11 @@ int main(int argc, char **argv)
 
 	/* Try attaching the 6.19+ variant first, fall back to older variant */
 	release_link = bpf_program__attach(skel->progs.mid_release_direct);
-	if (!release_link) {
+	if (libbpf_get_error(release_link)) {
 		release_link = bpf_program__attach(skel->progs.mid_release_kref);
-		if (!release_link) {
+		if (libbpf_get_error(release_link)) {
 			fprintf(stderr, "Failed to attach __release_mid (tried both variants)\n");
+			release_link = NULL;
 			goto cleanup;
 		}
 	}
@@ -220,7 +219,6 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	printf("smbslower: BPF programs attached and pinned.\n");
 	printf("  Ring buffer: %s\n", RINGBUF_PINNED);
 	printf("  Detach from Python consumer to remove.\n");
 
