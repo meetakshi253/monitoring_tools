@@ -12,10 +12,10 @@ msg = @printf '  %-8s %s%s\n'					\
 # only x86 for now
 ARCH := $(shell uname -m | sed 's/x86_64/x86/')
 
-VMLINUX := src/include/$(ARCH)/vmlinux.h
-VMLINUXCIFS := src/include/$(ARCH)/cifs_btf.h
+VMLINUX := src/common/$(ARCH)/vmlinux.h
+VMLINUXCIFS := src/common/$(ARCH)/cifs_btf.h
 
-INCLUDES := -Isrc/include/$(ARCH) -Isrc/include -I$(OUTPUT)
+INCLUDES := -Isrc/common/$(ARCH) -Isrc/common -I$(OUTPUT)
 CFLAGS := -g -Wall
 LIBS := -lbpf -lelf -lz -lrt
 
