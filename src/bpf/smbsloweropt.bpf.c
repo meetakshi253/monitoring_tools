@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /* Developed by Meetakshi Setiya */
 /* Copyright (c) 2026 Microsoft */
+
+/* Alternate version of smbslower with just one hook */
 #include "cifs_btf.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -20,6 +22,7 @@ struct {
 	__type(key, __u16); /* Command code */
 	__type(value, __u8); /* Dummy value */
 } denylist SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_ENTRIES * 4096);
@@ -44,78 +47,42 @@ static __always_inline long get_flags()
 
 static int probe_entry(struct mid_q_entry *mid_struct)
 {
-	struct smb_partial_event e;
-	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
+    struct event *e;
+    unsigned long when_alloc, when_free;
+    long flag = get_flags();
 
-	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
+    e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
+    if (!e) {
+        return 0;
+    }
+
+    when_alloc = BPF_CORE_READ(mid_struct, when_alloc);
+    when_free = bpf_jiffies64();
+
+    if (when_alloc > when_free) {
+        bpf_ringbuf_discard(e, flag);
+        return 0;
+    }
+
+    e->metric.latency_ns = (when_free - when_alloc) * (1000000000ULL / HZ);
+    if (e->metric.latency_ns < min_lat_ns) {
+        bpf_ringbuf_discard(e, flag);
+        return 0;
+    }
+
+    e->command = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
+    __u8 *blocked = bpf_map_lookup_elem(&denylist, &e->command);
 	if (blocked) {
 		return 0;
 	}
 
-	e.metric.latency_ns = bpf_ktime_get_ns();
-	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
-	return 0;
-}
-
-static int probe_exit(struct mid_q_entry *mid_struct)
-{
-	struct smb_partial_event *pe;
-	struct event *e;
-	long flag = get_flags();
-
-	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
-	if (!e) {
-		return 0;
-	}
-
-	pe = bpf_map_lookup_elem(&temp, &mid_struct);
-	if (!pe) {
-		bpf_ringbuf_discard(e, flag);
-		return 0;
-	}
-	bpf_map_delete_elem(&temp, &mid_struct);
-
-	e->cmd_end_time_ns = bpf_ktime_get_ns();
-	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
-
-	if (e->metric.latency_ns < min_lat_ns) {
-		bpf_ringbuf_discard(e, flag);
-		return 0;
-	}
-
-	unsigned long long when_alloc = BPF_CORE_READ(mid_struct, when_alloc);
-	unsigned long long when_free = bpf_jiffies64();
-	unsigned long long delta_ms = (when_free - when_alloc) * 1000 / HZ;
-	bpf_printk("from probes and from jiffes %llu and %llu\n", e->metric.latency_ns / 1000000, delta_ms);
-
-	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->rqst_id = BPF_CORE_READ(mid_struct, mid);
-	e->command = pe->smbcommand;
-	e->tool = SMBSLOWER;
-	bpf_get_current_comm(&e->task, sizeof(e->task));
-	bpf_ringbuf_submit(e, flag);
-
-	return 0;
-}
-
-SEC("fexit/smb2_mid_entry_alloc")
-int BPF_PROG(mid_alloc_fexit, void *shdr, void *server,
-struct mid_q_entry *mid_struct)
-{
-	if (mid_struct) {
-		return probe_entry(mid_struct);
-	}
-	return 0;
-}
-
-SEC("kretprobe/smb2_mid_entry_alloc")
-int BPF_KRETPROBE(mid_alloc_kretprobe)
-{
-	struct mid_q_entry *mid_struct = (struct mid_q_entry *)PT_REGS_RC(ctx);
-	if (mid_struct) {
-		return probe_entry(mid_struct);
-	}
-	return 0;
+    e->cmd_end_time_ns = bpf_ktime_get_ns();
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    e->rqst_id = BPF_CORE_READ(mid_struct, mid);
+    e->tool = SMBSLOWER;
+    bpf_get_current_comm(&e->task, sizeof(e->task));
+    bpf_ringbuf_submit(e, flag);
+    return 0;
 }
 
 /* Pre-6.19: __release_mid(struct kref *refcount) */
@@ -126,7 +93,7 @@ int BPF_PROG(mid_release_kref_fentry, struct kref *refcount) {
 	struct mid_q_entry *mid_struct =
 		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
 
-	return probe_exit(mid_struct);
+	return probe_entry(mid_struct);
 }
 
 SEC("kprobe/__release_mid")
@@ -136,16 +103,16 @@ int BPF_PROG(mid_release_kref_kprobe, struct kref *refcount) {
 	struct mid_q_entry *mid_struct =
 		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
 
-	return probe_exit(mid_struct);
+	return probe_entry(mid_struct);
 }
 
 /* 6.19+: __release_mid(struct TCP_Server_Info *server, struct mid_q_entry *midEntry) */
 SEC("fentry/__release_mid")
 int BPF_PROG(mid_release_direct_fentry, void *server, struct mid_q_entry *midEntry) {
-	return probe_exit(midEntry);
+	return probe_entry(midEntry);
 }
 
 SEC("kprobe/__release_mid")
 int BPF_PROG(mid_release_direct_kprobe, void *server, struct mid_q_entry *midEntry) {
-	return probe_exit(midEntry);
+	return probe_entry(midEntry);
 }
