@@ -41,13 +41,10 @@ static __always_inline long get_flags()
     return sz >= wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
 }
 
-SEC("fexit/smb2_mid_entry_alloc")
-int BPF_PROG(mid_alloc_fexit, struct smb2_hdr *shdr, struct TCP_Server_Info *server,
-struct mid_q_entry *mid_struct)
+static int probe_entry(struct mid_q_entry *mid_struct)
 {
-	(void)server;
 	struct smb_partial_event e;
-	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(shdr, Command));
+	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
 
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
 	if (blocked) {
@@ -55,12 +52,11 @@ struct mid_q_entry *mid_struct)
 	}
 
 	e.metric.latency_ns = bpf_ktime_get_ns();
-	e.mid = BPF_CORE_READ(mid_struct, mid);
 	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
 	return 0;
 }
 
-static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
+static int probe_exit(struct mid_q_entry *mid_struct)
 {
 	struct smb_partial_event *pe;
 	struct event *e;
@@ -87,7 +83,7 @@ static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->rqst_id = pe->mid;
+	e->rqst_id = BPF_CORE_READ(mid_struct, mid);
 	e->command = pe->smbcommand;
 	e->tool = SMBSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
@@ -96,19 +92,54 @@ static __always_inline int handle_release_mid(struct mid_q_entry *mid_struct)
 	return 0;
 }
 
+SEC("fexit/smb2_mid_entry_alloc")
+int BPF_PROG(mid_alloc_fexit, void *shdr, void *server,
+struct mid_q_entry *mid_struct)
+{
+	if (mid_struct) {
+		return probe_entry(mid_struct);
+	}
+	return 0;
+}
+
+SEC("kretprobe/smb2_mid_entry_alloc")
+int BPF_KRETPROBE(mid_alloc_kretprobe)
+{
+	struct mid_q_entry *mid_struct = (struct mid_q_entry *)PT_REGS_RC(ctx);
+	if (mid_struct) {
+		return probe_entry(mid_struct);
+	}
+	return 0;
+}
+
 /* Pre-6.19: __release_mid(struct kref *refcount) */
 SEC("fentry/__release_mid")
-int BPF_PROG(mid_release_kref, struct kref *refcount) {
+int BPF_PROG(mid_release_kref_fentry, struct kref *refcount) {
 	const typeof(((struct mid_q_entry *)0)->refcount) *__mptr =
 		(const typeof(((struct mid_q_entry *)0)->refcount) *)refcount;
 	struct mid_q_entry *mid_struct =
 		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
 
-	return handle_release_mid(mid_struct);
+	return probe_exit(mid_struct);
+}
+
+SEC("kprobe/__release_mid")
+int BPF_PROG(mid_release_kref_kprobe, struct kref *refcount) {
+	const typeof(((struct mid_q_entry *)0)->refcount) *__mptr =
+		(const typeof(((struct mid_q_entry *)0)->refcount) *)refcount;
+	struct mid_q_entry *mid_struct =
+		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
+
+	return probe_exit(mid_struct);
 }
 
 /* 6.19+: __release_mid(struct TCP_Server_Info *server, struct mid_q_entry *midEntry) */
 SEC("fentry/__release_mid")
-int BPF_PROG(mid_release_direct, void *server, struct mid_q_entry *midEntry) {
-	return handle_release_mid(midEntry);
+int BPF_PROG(mid_release_direct_fentry, void *server, struct mid_q_entry *midEntry) {
+	return probe_exit(midEntry);
+}
+
+SEC("kprobe/__release_mid")
+int BPF_PROG(mid_release_direct_kprobe, void *server, struct mid_q_entry *midEntry) {
+	return probe_exit(midEntry);
 }

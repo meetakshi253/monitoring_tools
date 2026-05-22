@@ -14,6 +14,7 @@
 
 #include "smb_diag.h"
 #include "smbslower.skel.h"
+#include "trace_helpers.c"
 
 #define warn(...)	     fprintf(stderr, __VA_ARGS__)
 
@@ -147,7 +148,7 @@ int update_denylist_map(struct smbslower_bpf *skel) {
 int main(int argc, char **argv)
 {
 	struct smbslower_bpf *skel;
-	struct bpf_link *release_link = NULL;
+	struct bpf_link *pin_release, *pin_alloc = NULL;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -164,10 +165,19 @@ int main(int argc, char **argv)
 	skel->rodata->min_lat_ns = min_lat_ms * 1000 * 1000;
 	skel->rodata->wakeup_data_size = wakeup_data_size;
 
-	/* Disable auto-attach for both __release_mid variants because
-	 * we want to load only one of them conditionally */
-	bpf_program__set_autoattach(skel->progs.mid_release_kref, false);
-	bpf_program__set_autoattach(skel->progs.mid_release_direct, false);
+	/* For mid_alloc: use fexit if fentry works, otherwise fall back to kretprobe */
+	if (fentry_can_attach("smb2_mid_entry_alloc", "cifs")) {
+		bpf_program__set_autoattach(skel->progs.mid_alloc_kretprobe, false);
+	} else {
+		bpf_program__set_autoattach(skel->progs.mid_alloc_fexit, false);
+	}
+
+	/* For __release_mid: disable auto-attach for all four variants,
+	 * we attach the correct one manually after load */
+	bpf_program__set_autoattach(skel->progs.mid_release_kref_fentry, false);
+	bpf_program__set_autoattach(skel->progs.mid_release_kref_kprobe, false);
+	bpf_program__set_autoattach(skel->progs.mid_release_direct_fentry, false);
+	bpf_program__set_autoattach(skel->progs.mid_release_direct_kprobe, false);
 
 	err = smbslower_bpf__load(skel);
 	if (err) {
@@ -186,21 +196,43 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Try attaching the 6.19+ variant first, fall back to older variant */
-	release_link = bpf_program__attach(skel->progs.mid_release_direct);
-	if (libbpf_get_error(release_link)) {
-		release_link = bpf_program__attach(skel->progs.mid_release_kref);
-		if (libbpf_get_error(release_link)) {
-			fprintf(stderr, "Failed to attach __release_mid (tried both variants)\n");
-			release_link = NULL;
-			goto cleanup;
+	/* Try attaching the 6.19+ variant first (fentry, then kprobe),
+	 * fall back to older kref variant (fentry, then kprobe) */
+
+	if (fentry_can_attach("__release_mid", "cifs")) {
+		pin_release = bpf_program__attach(skel->progs.mid_release_direct_fentry);
+		if (libbpf_get_error(pin_release)) {
+			pin_release = bpf_program__attach(skel->progs.mid_release_kref_fentry);
+			if (libbpf_get_error(pin_release))
+				pin_release = NULL;
 		}
 	}
+	else {
+		pin_release = bpf_program__attach(skel->progs.mid_release_direct_kprobe);
+		if (libbpf_get_error(pin_release)) {
+			pin_release = bpf_program__attach(skel->progs.mid_release_kref_kprobe);
+			if (libbpf_get_error(pin_release)) {
+				fprintf(stderr, "Failed to attach __release_mid (tried all variants)\n");
+				pin_release = NULL;
+			}
+		}
+	}
+
+	if (!pin_release) {
+		fprintf(stderr, "Failed to attach __release_mid\n");
+		goto cleanup;
+	}
+
+	/* Resolve which mid_alloc link was attached */
+	if(skel->links.mid_alloc_fexit)
+		pin_alloc = skel->links.mid_alloc_fexit;
+	else
+		pin_alloc = skel->links.mid_alloc_kretprobe;
 
 	/* Pin links so BPF programs survive this process exiting
 	 * that way, we do not need to keep the C program running to read from
 	 * the ringbuffer - we can just open the fd from Python */
-	err = bpf_link__pin(skel->links.mid_alloc_fexit, LINK_SMB_MID_ALLOC);
+	err = bpf_link__pin(pin_alloc, LINK_SMB_MID_ALLOC);
 	if (err) {
 		if (err == -EEXIST)
 			fprintf(stderr, "BPF links already pinned. Detach first.\n");
@@ -209,7 +241,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	err = bpf_link__pin(release_link, LINK_SMB_MID_RELEASE);
+	err = bpf_link__pin(pin_release, LINK_SMB_MID_RELEASE);
 	if (err) {
 		if (err == -EEXIST)
 			fprintf(stderr, "BPF links already pinned. Detach first.\n");
@@ -223,8 +255,8 @@ int main(int argc, char **argv)
 	printf("  Detach from Python consumer to remove.\n");
 
 cleanup:
-	if (release_link)
-		bpf_link__destroy(release_link);
+	if (pin_release)
+		bpf_link__destroy(pin_release);
 	smbslower_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
