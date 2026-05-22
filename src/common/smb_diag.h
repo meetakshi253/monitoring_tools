@@ -10,8 +10,7 @@
 #define SMBSLOWER	 		0
 
 struct smb_partial_event {
-	unsigned long long mid;
-	unsigned short smbcommand;
+	__u16 smbcommand;
 	union metrics metric;
 };
 

@@ -76,12 +76,13 @@ class Metrics(ctypes.Union):
 
 class Event(ctypes.Structure):
     _fields_ = [
-        ("pid", ctypes.c_int),
-        ("command", ctypes.c_int),
+        ("pid", ctypes.c_uint),
+        ("command", ctypes.c_ushort),
+        ("tool", ctypes.c_char),
+        ("_pad", ctypes.c_char),
         ("cmd_end_time_ns", ctypes.c_ulonglong),
         ("rqst_id", ctypes.c_ulonglong),
         ("metric", Metrics),
-        ("tool", ctypes.c_char),
         ("task", ctypes.c_char * TASK_COMM_LEN),
     ]
 

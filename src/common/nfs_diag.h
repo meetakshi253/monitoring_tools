@@ -9,18 +9,10 @@
 
 #define NFSSLOWER               10
 
-#define NFS4_READ               0
-#define NFS4_GETATTR            1
-#define NFS4_LOOKUP             2
-#define NFS4_ACCESS             3
-#define NFS4_OPEN               4
-#define NFS4_CLOSE              5
-
-#define NFS_ATTR_FATTR_FILEID   (1U << 11)
-
 struct nfs_partial_event {
-    int nfscommand;
+    __u16 nfscommand;
 	union metrics metric;
 };
+// __u16 is sufficient for nfscommand, even though rpc_procinfo stores it as u32
 
 #endif /* __NFS_DIAG_H */

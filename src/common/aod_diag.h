@@ -14,18 +14,18 @@
 #define LINK_NFS_RPC_EXIT    "/sys/fs/bpf/aod_nfs_rpc_exit"
 
 union metrics {
-	unsigned long long latency_ns;
+	__u64 latency_ns;
 	int retval;
 };
 
 struct event {
-	int pid;
-    int command;
-	unsigned long long cmd_end_time_ns;
-	unsigned long long rqst_id;
-	union metrics metric;
+	__u32 pid;
+    __u16 command;
 	char tool;
+	__u64 cmd_end_time_ns;
+	__u64 rqst_id;
+	union metrics metric;
 	char task[TASK_COMM_LEN];
-}; //56 bytes
+}; //~48 bytes
 
 #endif /* __AOD_DIAG_H */

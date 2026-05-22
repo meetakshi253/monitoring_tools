@@ -45,11 +45,8 @@ static __always_inline long get_flags()
 static int probe_entry(struct rpc_task *task)
 {
 	struct nfs_partial_event e;
-	__u32 cid;
+	e.nfscommand = (__u16)BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
 
-	cid = BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
-
-	e.nfscommand = cid;
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.nfscommand);
 	if (blocked) {
 		return 0;
@@ -66,8 +63,6 @@ static int probe_exit(struct rpc_task *task)
 	struct event *e;
 	long flag = get_flags();
 
-	int cid = BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
-
 	/* reserve space in the ringbuffer first */
 	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
 	if (!e) {
@@ -76,7 +71,7 @@ static int probe_exit(struct rpc_task *task)
 
 	pe = bpf_map_lookup_elem(&temp, &task);
 	if (!pe) {
-		bpf_ringbuf_discard(e, get_flags());
+		bpf_ringbuf_discard(e, flag);
 		return 0;
 	}
 	bpf_map_delete_elem(&temp, &task);
@@ -85,16 +80,16 @@ static int probe_exit(struct rpc_task *task)
 	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
 
 	if (e->metric.latency_ns < min_lat_ns) {
-		bpf_ringbuf_discard(e, get_flags());
+		bpf_ringbuf_discard(e, flag);
 		return 0;
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->command = pe->nfscommand;
 	e->rqst_id = bpf_ntohl(BPF_CORE_READ(task, tk_rqstp, rq_xid));
+	e->command = pe->nfscommand;
 	e->tool = NFSSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
-	bpf_ringbuf_submit(e, BPF_RB_FORCE_WAKEUP);
+	bpf_ringbuf_submit(e, flag);
 
 	return 0;
 }
