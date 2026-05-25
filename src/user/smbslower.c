@@ -149,7 +149,7 @@ int main(int argc, char **argv)
 {
 	struct smbslower_bpf *skel;
 	struct bpf_link *pin_release, *pin_alloc = NULL;
-	int err;
+	int err, release_mid_params;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) return err;
@@ -170,6 +170,19 @@ int main(int argc, char **argv)
 		bpf_program__set_autoattach(skel->progs.mid_alloc_kretprobe, false);
 	} else {
 		bpf_program__set_autoattach(skel->progs.mid_alloc_fexit, false);
+	}
+
+	/* Detect __release_mid signature via BTF param count to avoid
+	 * loading fentry programs with mismatched argument counts */
+	release_mid_params = get_func_param_count("__release_mid", "cifs");
+	if (release_mid_params >= 2) {
+		/* 6.19+: __release_mid(server, midEntry) */
+		bpf_program__set_autoload(skel->progs.mid_release_kref_fentry, false);
+		bpf_program__set_autoload(skel->progs.mid_release_kref_kprobe, false);
+	} else {
+		/* Pre-6.19 or unknown: __release_mid(struct kref *) */
+		bpf_program__set_autoload(skel->progs.mid_release_direct_fentry, false);
+		bpf_program__set_autoload(skel->progs.mid_release_direct_kprobe, false);
 	}
 
 	/* For __release_mid: disable auto-attach for all four variants,
@@ -196,27 +209,26 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Try attaching the 6.19+ variant first (fentry, then kprobe),
-	 * fall back to older kref variant (fentry, then kprobe) */
+	/* Attach the correct __release_mid variant based on detected param count.
+	 * Use fentry if available, otherwise fall back to kprobe. */
 
-	if (fentry_can_attach("__release_mid", "cifs")) {
-		pin_release = bpf_program__attach(skel->progs.mid_release_direct_fentry);
-		if (libbpf_get_error(pin_release)) {
+	if (release_mid_params >= 2) {
+		/* 6.19+: __release_mid(server, midEntry) */
+		if (fentry_can_attach("__release_mid", "cifs")) {
+			pin_release = bpf_program__attach(skel->progs.mid_release_direct_fentry);
+		} else {
+			pin_release = bpf_program__attach(skel->progs.mid_release_direct_kprobe);
+		}
+	} else {
+		/* Pre-6.19: __release_mid(struct kref *) */
+		if (fentry_can_attach("__release_mid", "cifs")) {
 			pin_release = bpf_program__attach(skel->progs.mid_release_kref_fentry);
-			if (libbpf_get_error(pin_release))
-				pin_release = NULL;
-		}
-	}
-	else {
-		pin_release = bpf_program__attach(skel->progs.mid_release_direct_kprobe);
-		if (libbpf_get_error(pin_release)) {
+		} else {
 			pin_release = bpf_program__attach(skel->progs.mid_release_kref_kprobe);
-			if (libbpf_get_error(pin_release)) {
-				fprintf(stderr, "Failed to attach __release_mid (tried all variants)\n");
-				pin_release = NULL;
-			}
 		}
 	}
+	if (libbpf_get_error(pin_release))
+		pin_release = NULL;
 
 	if (!pin_release) {
 		fprintf(stderr, "Failed to attach __release_mid\n");

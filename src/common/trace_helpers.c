@@ -98,3 +98,44 @@ cleanup:
 	btf__free(vmlinux_btf);
 	return result;
 }
+
+int get_func_param_count(const char *name, const char *mod)
+{
+	struct btf *btf, *vmlinux_btf, *module_btf = NULL;
+	const struct btf_type *func, *proto;
+	int id, btf_fd = 0, param_count = -1;
+
+	vmlinux_btf = btf__load_vmlinux_btf();
+	if (libbpf_get_error(vmlinux_btf))
+		return -1;
+
+	btf = vmlinux_btf;
+
+	if (mod) {
+		btf_fd = get_module_btf(mod, vmlinux_btf, &module_btf);
+		if (btf_fd < 0)
+			goto cleanup;
+		btf = module_btf;
+	}
+
+	id = btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
+	if (id <= 0)
+		goto cleanup;
+
+	func = btf__type_by_id(btf, id);
+	if (!func)
+		goto cleanup;
+
+	proto = btf__type_by_id(btf, func->type);
+	if (!proto)
+		goto cleanup;
+
+	param_count = btf_vlen(proto);
+
+cleanup:
+	if (btf_fd > 0)
+		close(btf_fd);
+	btf__free(module_btf);
+	btf__free(vmlinux_btf);
+	return param_count;
+}
