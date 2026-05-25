@@ -16,8 +16,8 @@ VMLINUX := src/common/$(ARCH)/vmlinux.h
 VMLINUXCIFS := src/common/$(ARCH)/cifs_btf.h
 
 INCLUDES := -Isrc/common/$(ARCH) -Isrc/common -I$(OUTPUT)
-CFLAGS := -g -Wall
-LIBS := -lbpf -lelf -lz -lrt
+CFLAGS := -g -Wall -static
+LIBS := -l:libbpf.a -lelf -lz -lrt
 
 # Clang system includes for BPF target
 CLANG_BPF_SYS_INCLUDES ?= $(shell $(CLANG) -v -E - </dev/null 2>&1 \
