@@ -44,7 +44,7 @@ static __always_inline long get_flags()
 
 static int probe_entry(struct rpc_task *task)
 {
-	struct nfs_partial_event e;
+	struct nfs_partial_event e = {};
 	e.nfscommand = (__u16)BPF_CORE_READ(task, tk_msg.rpc_proc, p_statidx);
 
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.nfscommand);

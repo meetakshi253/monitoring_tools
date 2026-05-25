@@ -43,7 +43,7 @@ static __always_inline long get_flags()
 
 static int probe_entry(struct mid_q_entry *mid_struct)
 {
-	struct smb_partial_event e;
+	struct smb_partial_event e = {};
 	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
 
 	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
