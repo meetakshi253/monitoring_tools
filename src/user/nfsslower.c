@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -17,6 +18,11 @@
 #include "trace_helpers.c"
 
 #define warn(...)	     fprintf(stderr, __VA_ARGS__)
+#define pr_info(fmt, ...) \
+    do { if (verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+
+static volatile sig_atomic_t exiting = 0;
+static bool verbose = false;
 
 static __u64 min_lat_ms = 10;
 static __u64 wakeup_data_size = 0; /* used to wake up the user space handler */
@@ -32,6 +38,7 @@ static const struct argp_option opts[] = {
 	{ "include-cmds", 'c', "INCLUDE", 0, "Allowed NFS4 commands to trace" },
 	{ "exclude-cmds", 'x', "EXCLUDE", 0, "NFS4 commands to exclude from tracing"},
 	{ "min", 'm', "MIN", 0, "Min latency to trace, in ms (default 10)" },
+	{ "verbose", 'v', NULL, 0, "Enable verbose output" },
     { NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
 	{},
 };
@@ -74,7 +81,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return 1;
 		}
 		include_mode = true;
-		printf("Include mode enabled, parsing commands: %s\n", arg);
+		pr_info("Include mode enabled, parsing commands: %s\n", arg);
 		int err = parse_cmd_list(arg, MAX_NFS_COMMANDS);
 		if (err < 0) {
 			warn("Failed to parse include commands: %s\n", arg);
@@ -91,7 +98,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return 1;
 		}
 		exclude_mode = true;
-		printf("Exclude mode enabled, parsing commands: %s\n", arg);
+		pr_info("Exclude mode enabled, parsing commands: %s\n", arg);
 		err = parse_cmd_list(arg, MAX_NFS_COMMANDS);
 		if (err < 0) {
 			warn("Failed to parse exclude commands: %s\n", arg);
@@ -112,6 +119,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'h':
 		argp_state_help(state, stderr, ARGP_HELP_STD_HELP);
 		break;
+	case 'v':
+		verbose = true;
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -125,9 +135,14 @@ static const struct argp argp = {
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-	if (level == LIBBPF_DEBUG)
+	if (!verbose && level > LIBBPF_WARN)
 		return 0;
 	return vfprintf(stderr, format, args);
+}
+
+static void sig_int(int signo)
+{
+	exiting = 1;
 }
 
 int update_denylist_map(struct nfsslower_bpf *skel) {
@@ -149,13 +164,15 @@ int update_denylist_map(struct nfsslower_bpf *skel) {
 int main(int argc, char **argv)
 {
     struct nfsslower_bpf *skel;
-	struct bpf_link *pin_seq, *pin_rpc;
 	int err;
 
     err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) return err;
 
     libbpf_set_print(libbpf_print_fn);
+
+	signal(SIGINT, sig_int);
+	signal(SIGTERM, sig_int);
 
     skel = nfsslower_bpf__open();
     if (!skel) {
@@ -167,23 +184,23 @@ int main(int argc, char **argv)
     skel->rodata->wakeup_data_size = wakeup_data_size;
 
 	if (fentry_can_attach("nfs4_setup_sequence", "nfsv4")) {
-		printf("Attaching to nfs4_setup_sequence with fentry\n");
+		pr_info("Attaching to nfs4_setup_sequence with fentry\n");
 		bpf_program__set_autoload(skel->progs.nfs4_setup_sequence_kprobe, false);
 		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_kprobe, false);
 	}
 	else {
-		printf("Attaching to nfs4_setup_sequence with kprobe\n");
+		pr_info("Attaching to nfs4_setup_sequence with kprobe\n");
 		bpf_program__set_autoload(skel->progs.nfs4_setup_sequence_entry, false);
 		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_entry, false);
 	}
 	
 	if(fentry_can_attach("rpc_exit_task", "sunrpc")) {
-		printf("Attaching to rpc_exit_task with fentry\n");
+		pr_info("Attaching to rpc_exit_task with fentry\n");
 		bpf_program__set_autoload(skel->progs.rpc_done_kprobe, false);
 		bpf_program__set_autoattach(skel->progs.rpc_done_kprobe, false);
 	}
 	else {
-		printf("Attaching to rpc_exit_task with kprobe\n");
+		pr_info("Attaching to rpc_exit_task with kprobe\n");
 		bpf_program__set_autoload(skel->progs.rpc_done_entry, false);
 		bpf_program__set_autoattach(skel->progs.rpc_done_entry, false);
 	}
@@ -205,39 +222,12 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Resolve which links were actually attached */
-	if (skel->links.nfs4_setup_sequence_entry)
-		pin_seq = skel->links.nfs4_setup_sequence_entry;
-	else
-		pin_seq = skel->links.nfs4_setup_sequence_kprobe;
+	pr_info("  Ring buffer: %s\n", RINGBUF_PINNED);
+	pr_info("  Consume and detach from python. Ctrl+C to exit.\n");
 
-	if (skel->links.rpc_done_entry)
-		pin_rpc = skel->links.rpc_done_entry;
-	else
-		pin_rpc = skel->links.rpc_done_kprobe;
-
-	/* Pin the links so the process can exit without removing them */
-	err = bpf_link__pin(pin_seq, LINK_NFS_SEQ_SETUP);
-	if (err) {
-		if (err == -EEXIST)
-			fprintf(stderr, "BPF links already pinned. Detach first.\n");
-		else
-			fprintf(stderr, "Failed to pin seq_setup link: %s\n", strerror(-err));
-		goto cleanup;
+	while (!exiting) {
+		pause();
 	}
-
-	err = bpf_link__pin(pin_rpc, LINK_NFS_RPC_EXIT);
-	if (err) {
-		if (err == -EEXIST)
-			fprintf(stderr, "BPF links already pinned. Detach first.\n");
-		else
-			fprintf(stderr, "Failed to pin rpc_exit link: %s\n", strerror(-err));
-		unlink(LINK_NFS_SEQ_SETUP);
-		goto cleanup;
-	}
-
-	printf("  Ring buffer: %s\n", RINGBUF_PINNED);
-	printf("  Detach from Python consumer to remove.\n");
 
 cleanup:
     nfsslower_bpf__destroy(skel);

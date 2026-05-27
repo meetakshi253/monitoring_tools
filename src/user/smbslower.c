@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
@@ -17,6 +18,11 @@
 #include "trace_helpers.c"
 
 #define warn(...)	     fprintf(stderr, __VA_ARGS__)
+#define pr_info(fmt, ...) \
+    do { if (verbose) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+
+static volatile sig_atomic_t exiting = 0;
+static bool verbose = false;
 
 static __u64 min_lat_ms = 10;
 static __u64 wakeup_data_size = 0; /* used to wake up the user space handler */
@@ -32,6 +38,7 @@ static const struct argp_option opts[] = {
 	{ "include-cmds", 'c', "INCLUDE", 0, "Allowed SMB commands to trace" },
 	{ "exclude-cmds", 'x', "EXCLUDE", 0, "SMB commands to exclude from tracing"},
 	{ "min", 'm', "MIN", 0, "Min latency to trace, in ms (default 10)" },
+	{ "verbose", 'v', NULL, 0, "Enable verbose output" },
 	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
 	{},
 };
@@ -73,7 +80,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return 1;
 		}
 		include_mode = true;
-		printf("Include mode enabled, parsing commands: %s\n", arg);
+		pr_info("Include mode enabled, parsing commands: %s\n", arg);
 		int err = parse_cmd_list(arg, MAX_SMB_COMMANDS);
 		if (err < 0) {
 			warn("Failed to parse include commands: %s\n", arg);
@@ -90,7 +97,7 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 			return 1;
 		}
 		exclude_mode = true;
-		printf("Exclude mode enabled, parsing commands: %s\n", arg);
+		pr_info("Exclude mode enabled, parsing commands: %s\n", arg);
 		err = parse_cmd_list(arg, MAX_SMB_COMMANDS);
 		if (err < 0) {
 			warn("Failed to parse exclude commands: %s\n", arg);
@@ -111,6 +118,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case 'h':
 		argp_state_help(state, stderr, ARGP_HELP_STD_HELP);
 		break;
+	case 'v':
+		verbose = true;
+		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -124,9 +134,14 @@ static const struct argp argp = {
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
-	if (level == LIBBPF_DEBUG)
+	if (!verbose && level > LIBBPF_WARN)
 		return 0;
 	return vfprintf(stderr, format, args);
+}
+
+static void sig_int(int signo)
+{
+	exiting = 1;
 }
 
 int update_denylist_map(struct smbslower_bpf *skel) {
@@ -145,16 +160,20 @@ int update_denylist_map(struct smbslower_bpf *skel) {
 	return 0;
 }
 
+
 int main(int argc, char **argv)
 {
 	struct smbslower_bpf *skel;
-	struct bpf_link *pin_release, *pin_alloc = NULL;
 	int err, release_mid_params;
+	bool can_attach_fentry;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) return err;
 
 	libbpf_set_print(libbpf_print_fn);
+
+	signal(SIGINT, sig_int);
+	signal(SIGTERM, sig_int);
 
 	skel = smbslower_bpf__open();
 	if (!skel) {
@@ -167,32 +186,53 @@ int main(int argc, char **argv)
 
 	/* For mid_alloc: use fexit if fentry works, otherwise fall back to kretprobe */
 	if (fentry_can_attach("smb2_mid_entry_alloc", "cifs")) {
+		pr_info("Attaching to smb2_mid_entry_alloc with fexit\n");
 		bpf_program__set_autoattach(skel->progs.mid_alloc_kretprobe, false);
 		bpf_program__set_autoload(skel->progs.mid_alloc_kretprobe, false);
 	} else {
+		pr_info("Attaching to smb2_mid_entry_alloc with kretprobe\n");
 		bpf_program__set_autoattach(skel->progs.mid_alloc_fexit, false);
 		bpf_program__set_autoload(skel->progs.mid_alloc_fexit, false);
 	}
 
-	/* Detect __release_mid signature via BTF param count to avoid
-	 * loading fentry programs with mismatched argument counts */
-	release_mid_params = get_func_param_count("__release_mid", "cifs");
-	if (release_mid_params >= 2) {
-		/* 6.19+: __release_mid(server, midEntry) */
-		bpf_program__set_autoload(skel->progs.mid_release_kref_fentry, false);
-		bpf_program__set_autoload(skel->progs.mid_release_kref_kprobe, false);
-	} else {
-		/* Pre-6.19 or unknown: __release_mid(struct kref *) */
-		bpf_program__set_autoload(skel->progs.mid_release_direct_fentry, false);
-		bpf_program__set_autoload(skel->progs.mid_release_direct_kprobe, false);
-	}
-
-	/* For __release_mid: disable auto-attach for all four variants,
+	/* For __release_mid: disable auto-attach and auto-load for all four variants,
 	 * we attach the correct one manually after load */
+	bpf_program__set_autoload(skel->progs.mid_release_kref_fentry, false);
+	bpf_program__set_autoload(skel->progs.mid_release_kref_kprobe, false);
+	bpf_program__set_autoload(skel->progs.mid_release_direct_fentry, false);
+	bpf_program__set_autoload(skel->progs.mid_release_direct_kprobe, false);
 	bpf_program__set_autoattach(skel->progs.mid_release_kref_fentry, false);
 	bpf_program__set_autoattach(skel->progs.mid_release_kref_kprobe, false);
 	bpf_program__set_autoattach(skel->progs.mid_release_direct_fentry, false);
 	bpf_program__set_autoattach(skel->progs.mid_release_direct_kprobe, false);
+
+	/* Detect __release_mid signature via kernel version to avoid
+	 * loading fentry programs with mismatched argument counts.
+	 * Use fentry if available, otherwise fall back to kprobe. */
+	release_mid_params = get_func_param_count("__release_mid", "cifs");
+	can_attach_fentry = fentry_can_attach("__release_mid", "cifs");
+
+	if (can_attach_fentry) {
+		if (release_mid_params >= 2) {
+			pr_info("Attaching to __release_mid with fentry (server, mid)\n");
+			bpf_program__set_autoload(skel->progs.mid_release_direct_fentry, true);
+			bpf_program__set_autoattach(skel->progs.mid_release_direct_fentry, true);
+		} else {
+			pr_info("Attaching to __release_mid with fentry (struct kref *)\n");
+			bpf_program__set_autoload(skel->progs.mid_release_kref_fentry, true);
+			bpf_program__set_autoattach(skel->progs.mid_release_kref_fentry, true);
+		}
+	} else {
+		if (release_mid_params >= 2) {
+			pr_info("Attaching to __release_mid with kprobe (server, mid)\n");
+			bpf_program__set_autoload(skel->progs.mid_release_direct_kprobe, true);
+			bpf_program__set_autoattach(skel->progs.mid_release_direct_kprobe, true);
+		} else {
+			pr_info("Attaching to __release_mid with kprobe (struct kref *)\n");
+			bpf_program__set_autoload(skel->progs.mid_release_kref_kprobe, true);
+			bpf_program__set_autoattach(skel->progs.mid_release_kref_kprobe, true);
+		}
+	}
 
 	err = smbslower_bpf__load(skel);
 	if (err) {
@@ -211,66 +251,14 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* Attach the correct __release_mid variant based on detected param count.
-	 * Use fentry if available, otherwise fall back to kprobe. */
+	pr_info("  Ring buffer: %s\n", RINGBUF_PINNED);
+	pr_info("  Consume and detach from python. Ctrl+C to exit.\n");
 
-	if (release_mid_params >= 2) {
-		/* 6.19+: __release_mid(server, midEntry) */
-		if (fentry_can_attach("__release_mid", "cifs")) {
-			pin_release = bpf_program__attach(skel->progs.mid_release_direct_fentry);
-		} else {
-			pin_release = bpf_program__attach(skel->progs.mid_release_direct_kprobe);
-		}
-	} else {
-		/* Pre-6.19: __release_mid(struct kref *) */
-		if (fentry_can_attach("__release_mid", "cifs")) {
-			pin_release = bpf_program__attach(skel->progs.mid_release_kref_fentry);
-		} else {
-			pin_release = bpf_program__attach(skel->progs.mid_release_kref_kprobe);
-		}
+	while (!exiting) {
+		pause();
 	}
-	if (libbpf_get_error(pin_release))
-		pin_release = NULL;
-
-	if (!pin_release) {
-		fprintf(stderr, "Failed to attach __release_mid\n");
-		goto cleanup;
-	}
-
-	/* Resolve which mid_alloc link was attached */
-	if(skel->links.mid_alloc_fexit)
-		pin_alloc = skel->links.mid_alloc_fexit;
-	else
-		pin_alloc = skel->links.mid_alloc_kretprobe;
-
-	/* Pin links so BPF programs survive this process exiting
-	 * that way, we do not need to keep the C program running to read from
-	 * the ringbuffer - we can just open the fd from Python */
-	err = bpf_link__pin(pin_alloc, LINK_SMB_MID_ALLOC);
-	if (err) {
-		if (err == -EEXIST)
-			fprintf(stderr, "BPF links already pinned. Detach first.\n");
-		else
-			fprintf(stderr, "Failed to pin mid_alloc link: %s\n", strerror(-err));
-		goto cleanup;
-	}
-
-	err = bpf_link__pin(pin_release, LINK_SMB_MID_RELEASE);
-	if (err) {
-		if (err == -EEXIST)
-			fprintf(stderr, "BPF links already pinned. Detach first.\n");
-		else
-			fprintf(stderr, "Failed to pin mid_release link: %s\n", strerror(-err));
-		unlink(LINK_SMB_MID_ALLOC);
-		goto cleanup;
-	}
-
-	printf("  Ring buffer: %s\n", RINGBUF_PINNED);
-	printf("  Detach from Python consumer to remove.\n");
 
 cleanup:
-	if (pin_release)
-		bpf_link__destroy(pin_release);
 	smbslower_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;

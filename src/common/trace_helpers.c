@@ -2,6 +2,8 @@
 #include <bpf/btf.h>
 #include <bpf/libbpf.h>
 #include <string.h>
+#include <sys/utsname.h>
+#include <stdlib.h>
 
 static int get_module_btf(const char *mod, struct btf *vmlinux_btf,
 			  struct btf **module_btf)
@@ -99,43 +101,26 @@ cleanup:
 	return result;
 }
 
+static bool kernel_version_ge(int major, int minor)
+{
+	struct utsname buf;
+	int kmajor, kminor;
+
+	if (uname(&buf) != 0)
+		return false;
+	if (sscanf(buf.release, "%d.%d", &kmajor, &kminor) != 2)
+		return false;
+	return kmajor > major || (kmajor == major && kminor >= minor);
+}
+
 int get_func_param_count(const char *name, const char *mod)
 {
-	struct btf *btf, *vmlinux_btf, *module_btf = NULL;
-	const struct btf_type *func, *proto;
-	int id, btf_fd = 0, param_count = -1;
-
-	vmlinux_btf = btf__load_vmlinux_btf();
-	if (libbpf_get_error(vmlinux_btf))
-		return -1;
-
-	btf = vmlinux_btf;
-
-	if (mod) {
-		btf_fd = get_module_btf(mod, vmlinux_btf, &module_btf);
-		if (btf_fd < 0)
-			goto cleanup;
-		btf = module_btf;
-	}
-
-	id = btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
-	if (id <= 0)
-		goto cleanup;
-
-	func = btf__type_by_id(btf, id);
-	if (!func)
-		goto cleanup;
-
-	proto = btf__type_by_id(btf, func->type);
-	if (!proto)
-		goto cleanup;
-
-	param_count = btf_vlen(proto);
-
-cleanup:
-	if (btf_fd > 0)
-		close(btf_fd);
-	btf__free(module_btf);
-	btf__free(vmlinux_btf);
-	return param_count;
+	/*
+	 * __release_mid signature changed in 6.19, but went to 7.0 stable:
+	 *   pre-6.19: __release_mid(struct kref *kref)         — 1 param
+	 *   6.19+:    __release_mid(server, mid)               — 2 params
+	 */
+	(void)name;
+	(void)mod;
+	return kernel_version_ge(6, 19) ? 2 : 1;
 }
