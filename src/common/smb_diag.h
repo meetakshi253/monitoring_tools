@@ -12,6 +12,7 @@
 struct smb_partial_event {
 	__u16 smbcommand;
 	union metrics metric;
+	__u64 mid;
 };
 
 #endif /* __SMB_DIAG_H */

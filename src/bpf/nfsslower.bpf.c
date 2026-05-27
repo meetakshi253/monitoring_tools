@@ -42,6 +42,13 @@ static __always_inline long get_flags()
 	return sz >= wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
 }
 
+/** !Not ideal! The program still emits CORE relocations, but we are only
+ * concerned about Azure VM images for now. Most of them expose the module
+ * BTF. RHEL 8.10 runs the very old 4.18 kernel, which does not expose module
+ * BTF, only vmlinux. But we are good because sunrpc is a part of the main
+ * kernel, so rpc_task will always be relocated :)
+ */
+
 static int probe_entry(struct rpc_task *task)
 {
 	struct nfs_partial_event e = {};

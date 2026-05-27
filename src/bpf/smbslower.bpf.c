@@ -41,22 +41,19 @@ static __always_inline long get_flags()
     return sz >= wakeup_data_size ? BPF_RB_FORCE_WAKEUP : BPF_RB_NO_WAKEUP;
 }
 
-static int probe_entry(struct mid_q_entry *mid_struct)
-{
-	struct smb_partial_event e = {};
-	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
+/** Known issue: RHEL 8.10 running on the very old 4.18 kernel does not expose
+ * module BTF. We cannot use CORE relocations, so we need to rely on raw offsets.
+ * But, the mid_q_entry struct has changed across SMB versions. 
+ * For now, the code is broken on RHEL 8.10, but should work on the newer azure
+ * kernels. Using bpf_probe_read() does not suffice because ptr access of the mid
+ * and command fields also emits CORE relocations.
+ * One option is to rely on smb2_hdr because the header is always going to have a
+ * fixed layout. But that involves having a kprobe+kretprobe on the same
+ * smb2_mid_entry_alloc function.
+ * PS: BTFHubArchive does not have cifs module BTF for 4.18.
+ */
 
-	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
-	if (blocked) {
-		return 0;
-	}
-
-	e.metric.latency_ns = bpf_ktime_get_ns();
-	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
-	return 0;
-}
-
-static int probe_exit(struct mid_q_entry *mid_struct)
+static __always_inline int probe_exit(struct mid_q_entry *mid_struct)
 {
 	struct smb_partial_event *pe;
 	struct event *e;
@@ -83,7 +80,7 @@ static int probe_exit(struct mid_q_entry *mid_struct)
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
-	e->rqst_id = BPF_CORE_READ(mid_struct, mid);
+	e->rqst_id = pe->mid;
 	e->command = pe->smbcommand;
 	e->tool = SMBSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
@@ -96,9 +93,17 @@ SEC("fexit/smb2_mid_entry_alloc")
 int BPF_PROG(mid_alloc_fexit, void *shdr, void *server,
 struct mid_q_entry *mid_struct)
 {
-	if (mid_struct) {
-		return probe_entry(mid_struct);
+	struct smb_partial_event e = {};
+	e.smbcommand = bpf_le16_to_cpu(BPF_CORE_READ(mid_struct, command));
+
+	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
+	if (blocked) {
+		return 0;
 	}
+
+	e.metric.latency_ns = bpf_ktime_get_ns();
+	e.mid = BPF_CORE_READ(mid_struct, mid);
+	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
 	return 0;
 }
 
@@ -106,9 +111,24 @@ SEC("kretprobe/smb2_mid_entry_alloc")
 int BPF_KRETPROBE(mid_alloc_kretprobe)
 {
 	struct mid_q_entry *mid_struct = (struct mid_q_entry *)PT_REGS_RC(ctx);
-	if (mid_struct) {
-		return probe_entry(mid_struct);
+	__u16 cmd;
+	if (!mid_struct) {
+		return 0;
 	}
+
+	/* No CORE */
+	struct smb_partial_event e = {};
+	bpf_probe_read_kernel(&cmd, sizeof(cmd), &mid_struct->command);
+	e.smbcommand = bpf_le16_to_cpu(cmd);
+
+	__u8 *blocked = bpf_map_lookup_elem(&denylist, &e.smbcommand);
+	if (blocked) {
+		return 0;
+	}
+
+	e.metric.latency_ns = bpf_ktime_get_ns();
+	bpf_probe_read_kernel(&e.mid, sizeof(e.mid), &mid_struct->mid);
+	bpf_map_update_elem(&temp, &mid_struct, &e, BPF_NOEXIST);
 	return 0;
 }
 
@@ -128,7 +148,7 @@ int BPF_PROG(mid_release_kref_kprobe, struct kref *refcount) {
 	const typeof(((struct mid_q_entry *)0)->refcount) *__mptr =
 		(const typeof(((struct mid_q_entry *)0)->refcount) *)refcount;
 	struct mid_q_entry *mid_struct =
-		(struct mid_q_entry *)((char *)__mptr - __builtin_preserve_field_info(((struct mid_q_entry *)0)->refcount, BPF_FIELD_BYTE_OFFSET));
+		(struct mid_q_entry *)((char *)__mptr - __builtin_offsetof(struct mid_q_entry, refcount));
 
 	return probe_exit(mid_struct);
 }

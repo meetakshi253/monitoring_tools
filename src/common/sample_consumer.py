@@ -87,7 +87,8 @@ class Event(ctypes.Structure):
     ]
 
 # ---------------------------------------------------------------------------
-# Detach — unpin BPF links and (if nothing remains) the ring buffer
+# Detach — unpin BPF links and (if nothing remains) the ring buffer. 
+# In our case, the AODV2 daemon will handle it.
 # ---------------------------------------------------------------------------
 def detach(tools=None):
     """Unpin BPF links for the given tools (list of 'smb'/'nfs', or None for all).
