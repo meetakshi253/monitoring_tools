@@ -159,7 +159,7 @@ int main(int argc, char **argv)
 
     skel = nfsslower_bpf__open();
     if (!skel) {
-        fprintf(stderr, "Failed to open and load BPF skeleton\n");
+        fprintf(stderr, "Failed to open BPF skeleton\n");
         return 1;
     }
 
@@ -167,16 +167,24 @@ int main(int argc, char **argv)
     skel->rodata->wakeup_data_size = wakeup_data_size;
 
 	if (fentry_can_attach("nfs4_setup_sequence", "nfsv4")) {
+		printf("Attaching to nfs4_setup_sequence with fentry\n");
+		bpf_program__set_autoload(skel->progs.nfs4_setup_sequence_kprobe, false);
 		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_kprobe, false);
 	}
 	else {
+		printf("Attaching to nfs4_setup_sequence with kprobe\n");
+		bpf_program__set_autoload(skel->progs.nfs4_setup_sequence_entry, false);
 		bpf_program__set_autoattach(skel->progs.nfs4_setup_sequence_entry, false);
 	}
 	
 	if(fentry_can_attach("rpc_exit_task", "sunrpc")) {
+		printf("Attaching to rpc_exit_task with fentry\n");
+		bpf_program__set_autoload(skel->progs.rpc_done_kprobe, false);
 		bpf_program__set_autoattach(skel->progs.rpc_done_kprobe, false);
 	}
 	else {
+		printf("Attaching to rpc_exit_task with kprobe\n");
+		bpf_program__set_autoload(skel->progs.rpc_done_entry, false);
 		bpf_program__set_autoattach(skel->progs.rpc_done_entry, false);
 	}
 

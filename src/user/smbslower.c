@@ -168,8 +168,10 @@ int main(int argc, char **argv)
 	/* For mid_alloc: use fexit if fentry works, otherwise fall back to kretprobe */
 	if (fentry_can_attach("smb2_mid_entry_alloc", "cifs")) {
 		bpf_program__set_autoattach(skel->progs.mid_alloc_kretprobe, false);
+		bpf_program__set_autoload(skel->progs.mid_alloc_kretprobe, false);
 	} else {
 		bpf_program__set_autoattach(skel->progs.mid_alloc_fexit, false);
+		bpf_program__set_autoload(skel->progs.mid_alloc_fexit, false);
 	}
 
 	/* Detect __release_mid signature via BTF param count to avoid
