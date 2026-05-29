@@ -22,14 +22,14 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_ENTRIES * 4096);
+	__uint(max_entries, MAX_ENTRIES * 24); /* can handle ~1.5x partial events */
 	__type(key, struct rpc_task *); /* ptr to rpc_task */
 	__type(value, struct nfs_partial_event);
 } temp SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, MAX_ENTRIES * 4096); // should always be a multiple of the page size
+	__uint(max_entries, MAX_ENTRIES * 4096); /* should always be a multiple of the page size: can handle 174k events */
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } aodrb SEC(".maps");
 
@@ -68,18 +68,17 @@ static int probe_exit(struct rpc_task *task)
 {
 	struct nfs_partial_event *pe;
 	struct event *e;
-	long flag = get_flags();
 
 	pe = bpf_map_lookup_elem(&temp, &task);
 	if (!pe) {
 		return 0;
 	}
 
-	e->cmd_end_time_ns = bpf_ktime_get_ns();
-	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
+	__u64 now = bpf_ktime_get_ns();
+	__u64 latency = now - pe->metric.latency_ns;
 	bpf_map_delete_elem(&temp, &task);
 
-	if (e->metric.latency_ns < min_lat_ns) {
+	if (latency < min_lat_ns) {
 		return 0;
 	}
 
@@ -89,11 +88,13 @@ static int probe_exit(struct rpc_task *task)
 	}
 
 	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->cmd_end_time_ns = now;
+	e->metric.latency_ns = latency;
 	e->rqst_id = bpf_ntohl(BPF_CORE_READ(task, tk_rqstp, rq_xid));
 	e->command = pe->nfscommand;
 	e->tool = NFSSLOWER;
 	bpf_get_current_comm(&e->task, sizeof(e->task));
-	bpf_ringbuf_submit(e, flag);
+	bpf_ringbuf_submit(e, get_flags());
 
 	return 0;
 }
