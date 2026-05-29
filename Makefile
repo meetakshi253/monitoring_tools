@@ -33,7 +33,7 @@ USER_SRCS := $(wildcard src/user/*.c)
 USER_BINS := $(patsubst src/user/%.c,$(BINOUT)/%,$(USER_SRCS))
 
 .PHONY: all
-all: $(USER_BINS)
+all: $(USER_BINS) $(BINOUT)/libringbuf_shim.so
 
 # Allow building individual targets by short name (e.g., make minimal)
 APPS := $(notdir $(USER_BINS))
@@ -69,6 +69,11 @@ $(OUTPUT)/%.skel.h: $(OUTPUT)/%.bpf.o | $(OUTPUT)
 $(BINOUT)/%: src/user/%.c $(OUTPUT)/%.skel.h $(COMMON_SRCS) | $(BINOUT)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) $(INCLUDES) $< $(COMMON_SRCS) -o $@ $(LIBS)
+
+# 4) Build ring buffer shim shared library (consumed by Python via ctypes)
+$(BINOUT)/libringbuf_shim.so: src/ringbuf_shim.c | $(BINOUT)
+	$(call msg,SO,$@)
+	$(Q)$(CC) -fPIC -shared -g -Wall $(INCLUDES) $< -o $@ -lbpf
 
 # Keep intermediate files (.bpf.o, .skel.h)
 .SECONDARY:
