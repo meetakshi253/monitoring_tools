@@ -70,24 +70,21 @@ static int probe_exit(struct rpc_task *task)
 	struct event *e;
 	long flag = get_flags();
 
-	/* reserve space in the ringbuffer first */
-	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
-	if (!e) {
-		return 0;
-	}
-
 	pe = bpf_map_lookup_elem(&temp, &task);
 	if (!pe) {
-		bpf_ringbuf_discard(e, flag);
 		return 0;
 	}
-	bpf_map_delete_elem(&temp, &task);
 
 	e->cmd_end_time_ns = bpf_ktime_get_ns();
 	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
+	bpf_map_delete_elem(&temp, &task);
 
 	if (e->metric.latency_ns < min_lat_ns) {
-		bpf_ringbuf_discard(e, flag);
+		return 0;
+	}
+
+	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
+	if (!e) {
 		return 0;
 	}
 

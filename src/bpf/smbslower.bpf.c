@@ -59,23 +59,21 @@ static __always_inline int probe_exit(struct mid_q_entry *mid_struct)
 	struct event *e;
 	long flag = get_flags();
 
-	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
-	if (!e) {
-		return 0;
-	}
-
 	pe = bpf_map_lookup_elem(&temp, &mid_struct);
 	if (!pe) {
-		bpf_ringbuf_discard(e, flag);
 		return 0;
 	}
-	bpf_map_delete_elem(&temp, &mid_struct);
 
 	e->cmd_end_time_ns = bpf_ktime_get_ns();
 	e->metric.latency_ns = e->cmd_end_time_ns - pe->metric.latency_ns;
+	bpf_map_delete_elem(&temp, &mid_struct);
 
 	if (e->metric.latency_ns < min_lat_ns) {
-		bpf_ringbuf_discard(e, flag);
+		return 0;
+	}
+
+	e = bpf_ringbuf_reserve(&aodrb, sizeof(struct event), 0);
+	if (!e) {
 		return 0;
 	}
 
